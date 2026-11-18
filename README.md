@@ -12,7 +12,19 @@ The Firebase project config (`astrawish`) is already set in `app.js` (`FIREBASE_
 Do these once in the Firebase Console:
 1. Authentication > Sign-in method: turn on **Email/Password** and **Google**.
 2. Authentication > Settings > Authorized domains: add the domain of your site, for example `astrawish.vercel.app` (no https://).
-No Firestore or Database rules are needed. Savings data is stored on the device.
+3. Build > **Firestore Database** > Create database (production mode, any region near you).
+4. Firestore > **Rules** tab: replace everything with the rules below, then **Publish**:
+```
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /users/{uid} {
+      allow read, write: if request.auth != null && request.auth.uid == uid;
+    }
+  }
+}
+```
+Signed-in data (savings, history, goal, fates, streak, owned characters, quests, name) is saved to Firestore at `users/{uid}`, so it is the same on every device. Guest data stays on the device only. Each user can only read and write their own document.
 
 ## Deploy on Vercel
 1. Put all files in the root of a GitHub repo (`assets/` stays a folder). GitHub web upload takes up to 100 files at a time, so upload `assets/` in batches.

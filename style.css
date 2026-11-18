@@ -403,3 +403,10 @@ main > section[id^="view-"] > :nth-child(n+8), #navSections > :nth-child(n+8) { 
   .drawer-panel { width: 340px; }
 }
 @media (prefers-reduced-motion: reduce) { main > section[id^="view-"] > *, #navSections > * { animation: none; } .bar > i { transition: none; } .orb, .drawer-panel { animation: none; } .rail { scroll-behavior: auto; } }
+.src.empty h3 { color: var(--muted); }
+.src.empty .srcinfo { min-height: 64px; }
+.streakpop { display: flex; flex-direction: column; align-items: center; gap: 4px; text-align: center; }
+.streakpop .flame { width: 72px; height: 72px; }
+.streakpop .snum { font-size: 44px; font-weight: 700; line-height: 1; }
+.streakpop .slab { color: var(--muted); font-size: 14px; }
+.streakpop p { margin-top: 8px; }

@@ -41,15 +41,22 @@
     try { var raw = localStorage.getItem(curKey); if (raw) s = JSON.parse(raw); } catch (e) {}
     if (!s && mem && memKey === curKey) s = mem;
     if (!s || typeof s !== "object") return fresh();
+    return normalize(s);
+  }
+  function normalize(s) {
     var d = fresh();
     for (var k in d) if (!(k in s)) s[k] = d[k];
     if (!Array.isArray(s.owned)) s.owned = [];
+    if (!Array.isArray(s.history)) s.history = [];
     if (!s.quests || typeof s.quests !== "object") s.quests = {};
+    if (!s.streak || typeof s.streak !== "object") s.streak = { count: 0, last: null };
     if (typeof s.fates !== "number" || !(s.fates >= 0)) s.fates = 0;
     return s;
   }
   var state = load();
-  function save() { mem = state; memKey = curKey; try { localStorage.setItem(curKey, JSON.stringify(state)); } catch (e) {} renderTop(); }
+  var fbDb = null, cloudReady = false, cloudSettled = false, cloudUnsub = null, pushT = null, cloudWarned = false, remindedDay = null;
+  function writeLocal() { mem = state; memKey = curKey; try { localStorage.setItem(curKey, JSON.stringify(state)); } catch (e) {} }
+  function save() { state.ts = Date.now(); writeLocal(); renderTop(); queuePush(); }
   function seen() { try { if (localStorage.getItem(SEEN) === "1") return true; } catch (e) {} return seenMem; }
   function setSeen() { seenMem = true; try { localStorage.setItem(SEEN, "1"); } catch (e) {} }
 
@@ -64,6 +71,33 @@
     if (gap === 0) return { n: s.count, today: true };
     if (gap === 1) return { n: s.count, today: false };
     return { n: 0, today: false };
+  }
+  function bumpStreak(now) {
+    var today = dayKey(now), s = state.streak, first = s.last !== today;
+    if (!s.last) s.count = 1; else { var gap = daysBetween(s.last, today); if (gap === 1) s.count += 1; else if (gap > 1 || gap < 0) s.count = 1; }
+    s.last = today; return first;
+  }
+  var FLAME = '<svg class="flame" viewBox="0 0 32 32" aria-hidden="true"><path d="M16 2c1 5 6 8 6 14.2A7 7 0 0 1 9 19.5c0-2.8 1.4-4.5 2.6-6 .5 2 1.6 2.8 2.6 3C13.6 12 14.2 6 16 2Z" fill="#FF9A55"/></svg>';
+  function showStreakSaved() {
+    var node = document.createElement("div"); node.className = "streakpop";
+    node.innerHTML = FLAME + '<div class="snum">' + state.streak.count + '</div><div class="slab">day streak</div><p>Keep going and be consistent.</p>';
+    $("toast").hidden = true;
+    dialog({ title: "Streak Saved!", node: node, lock: true, buttons: [{ label: "Got it" }] });
+  }
+  function maybeRemind() {
+    if (document.body.getAttribute("data-view") !== "dashboard") return;
+    if (!(user || guest)) return;
+    if (user && fbDb && !cloudSettled) return;
+    var today = dayKey(new Date()); if (remindedDay === today) return;
+    var st = currentStreak(); if (st.today) return;
+    remindedDay = today;
+    setTimeout(function () {
+      if (openId || document.body.getAttribute("data-view") !== "dashboard" || currentStreak().today) return;
+      var alive = st.n > 0;
+      dialog({ title: alive ? "Keep your streak alive" : "Start your streak", lock: true,
+        html: "<p>You haven't added any Primogems today. Don't forget to log in to the game and start farming to gain savings.</p><p>Then come back and add them here " + (alive ? "to keep your streak going." : "to start your streak.") + "</p>",
+        buttons: [{ label: "Got it" }] });
+    }, 350);
   }
   function parseInt0(str) {
     var t = String(str).replace(/[,\s]/g, "");
@@ -208,7 +242,8 @@
       var holder = sib || t.closest("section.card");
       var before = holder.getBoundingClientRect().top;
       if (i >= 0) state.owned.splice(i, 1); else state.owned.push(name);
-      save(); renderChara();
+      if (nowOwned && state.goal === name) state.goal = DEFAULT_GOAL;
+      save(); renderChara(); renderDash();
       var keep = sibName ? document.querySelector('.tile[data-name="' + sibName.replace(/"/g, '\\"') + '"]') : holder;
       if (keep) {
         window.scrollBy(0, keep.getBoundingClientRect().top - before);
@@ -222,8 +257,15 @@
     var node = document.createElement("div"); node.style.cssText = "display:flex;flex-direction:column;gap:10px";
     var who = document.createElement("div"); who.className = "who"; who.appendChild(elIcon(c.el));
     who.appendChild(document.createTextNode(c.el || "Unknown element")); if (c.r) { var sr2 = document.createElement("span"); sr2.className = "stars"; sr2.setAttribute("aria-label", c.r + " star"); sr2.textContent = "★★★★★".slice(0, c.r); who.appendChild(sr2); }
-    var st = document.createElement("p"); st.textContent = own ? "In your Owned collection." : "Not owned yet. Use the pen at the top to mark owned characters.";
+    var st = document.createElement("p"); st.textContent = own ? "Would you like to remove " + c.n + " from your owned characters?" : "Not owned yet. Use the pen at the top to mark owned characters.";
     node.appendChild(who); node.appendChild(st);
+    if (own) {
+      dialog({ title: c.n, node: node, buttons: [
+        { label: "No", cls: "ghost" },
+        { label: "Yes, remove", fn: function () { var j = state.owned.indexOf(c.n); if (j >= 0) state.owned.splice(j, 1); save(); renderChara(); renderDash(); toast(c.n + " moved to Not owned"); } }
+      ] });
+      return;
+    }
     dialog({ title: c.n, node: node, buttons: [
       { label: "Close", cls: "ghost" },
       { label: "Set as Saving Goal", fn: function () { state.goal = c.n; save(); renderDash(); toast(c.n + " is now your saving goal"); } }
@@ -238,10 +280,35 @@
   function shrine(n, c, tot, cnt, each, extra) { return { t: n, ic: "p", r: [["p", tot + " Primogems total"]], i: [cnt + " shrines", each + " Primogems each"].concat(extra ? [extra] : []) }; }
   function wp(n, c, tot) { return { t: n, ic: "p", r: [["p", tot + " Primogems total"]], i: [c + " Teleport Waypoints", "5 Primogems each discovery"] }; }
   var SOURCES = [
-    { h: "Combat", cards: [
+    { h: "Renewable", cards: [
+      { t: "Daily Commissions", ic: "p", r: [["p", "60 Primogems every day"]], loc: "Adventurers' Guild, all nations, from Katheryne" },
       { t: "Spiral Abyss", ic: "p", r: [["p", "800 Primogems total"]], i: ["200 Primogems per floor"], loc: "Mondstadt" },
-      { t: "Stygian Onslaught", ic: "p", r: [["p", "450 Primogems"]], loc: "Liyue" },
-      { t: "Imaginarium Theater", ic: "p", r: [["p", "1,000 Primogems total"]], i: ["When every act is completed and all Stella are collected"], loc: "Mondstadt" }
+      { t: "Stygian Onslaught", ic: "p", r: [["p", "450 Primogems"]], i: ["A combat domain that resets monthly and gives rewards."], loc: "Liyue" },
+      { t: "Imaginarium Theater", ic: "p", r: [["p", "1,000 Primogems total"]], i: ["When every act is completed and all Stella are collected"], loc: "Mondstadt" },
+      { t: "Hoyolab Daily Login", ic: "p", r: [["p", "60 Primogems"]], i: ["Go to Check-in and log in every day. It resets every month. You get 20 Primogems 3 times, for a total of 60."] },
+      { t: "Wonderland Treasures", ic: "p", r: [["p", "60 Primogems"]], i: ["Play any popular Miliastra Wonderland game to get 60 Primogems."] },
+      { t: "Repertoire of Myriad Melodies", ic: "p", r: [["p", "60 Primogems"]], i: ["The game releases music events. Play the rhythm games many times at different difficulties to get rewards."] }
+    ] },
+    { h: "One-time Rewards", help: { title: "About One-time Rewards", html: "<p>You can get each of these rewards only once.</p><p>After you finish them and collect every reward, you will no longer get any more from them.</p>" }, cards: [
+      { t: "Archon Quest", ic: "f", r: [["f", "Intertwined Fates"]], i: ["Once you finish a chapter and act, you get the rewards one time.", "New Archon Quests are added with every update."], img: "nav archon quest" },
+      { t: "World Quest", ic: "p", r: [["p", "Primogems"]], i: ["You get the rewards one time for each World Quest you finish.", "More World Quests are added as the game updates and the map expands."], img: "nav world quest" },
+      { t: "Shrine of Depths", ic: "p", r: [["p", "80+ Primogems (max)"]], i: ["Shrines of Depths can be found in all nations. Once you open them all, they never reset, so you can't claim them again."] },
+      { t: "Character Story", ic: "p", r: [["p", "60 Primogems per character story"]], i: ["Some characters also unlock Bosses, Domains and Realms that you can't reach by exploration."] },
+      { t: "Serenitea Pot", ic: "p", r: [["p", "40+ Primogems"]], i: ["Make furnishings for your companions and level up their Trust Rank to get rewards."] },
+      { t: "Adventure Rank", ic: "p", r: [["p", "60+ Primogems"]], i: ["Some Adventure Ranks give a random amount of Primogems."] },
+      { t: "Tutorial", ic: "p", r: [["p", "1 Primogem each"]], i: ["Discover new gameplay and open its tutorial to get 1 Primogem for each tutorial."] },
+      { t: "One-Time Domain", ic: "p", r: [["p", "40 Primogems"]], i: ["A Domain that gives rewards once, after you finish the challenge."] }
+    ] },
+    { h: "Limited Availability", cards: [
+      { t: "Redemption Codes", ic: "p", r: [["p", "40+ Primogems"]], i: ["HoYoverse releases codes on social media and during livestreams. Copy a code and redeem it to get rewards."] },
+      { t: "Web Event", ic: "p", r: [["p", "Primogems"]], i: ["The game releases web events. Log in and take part to get rewards."] },
+      { t: "Character Test Runs", ic: "p", r: [["p", "40 Primogems (20 each)"]], i: ["When the banners update, there are 2 banners with 2 test runs. Play the featured character to get rewards."] },
+      { t: "Update Compensation", ic: "p", r: [["p", "600 Primogems"]], i: ["With every update, the game gives two mails of 300 Primogems each. Claim them from your Mailbox before they expire."] }
+    ] },
+    { h: "Exploration", cards: [
+      { t: "Discover Waypoints", ic: "p", r: [["p", "5 Primogems each"]], i: ["Unlock all of the Waypoints in every region to explore undiscovered places."], img: "discover waypoints" },
+      { t: "Compass & Collect", ic: "p", i: ["Finish the Reputation quests and get the Compass to locate all of the Chests in the region.", "Note: every region has its own Compass, so you have to get them one by one."], img: "compass and collect" },
+      { t: "Complete & Maximize", ic: "p", i: ["Take on World Quests and max out the regions to discover other Realms.", "Examples: Temple of Space, Enkanomiya, Sea of Bygone Eras, Frostmoon Enclave and more."], img: "complete and maximize" }
     ] },
     { h: "Special Regional Offerings", help: true, cards: [
       { t: "Sacred Sakura Favor", ic: "f", r: [["f", "10 Intertwined Fates"]], i: ["Offering tree"], loc: "Inazuma", req: "Electro Sigils" },
@@ -263,7 +330,7 @@
       { t: "Nod-Krai", ic: "p", r: [["p", "900 Primogems total"]], i: ["100 Primogems per worship", "Requires 270 Lunoculi"] },
       { t: "Snezhnaya", ic: "p", r: [["p", "900 Primogems total"]], i: ["100 Primogems per worship", "Requires 270 Cryoculi"] }
     ] },
-    { h: "Shrines of Depths", cards: [
+    { h: "Shrines of Depths", help: { title: "How to get", html: "<p>Each Shrine of Depths requires 1 key to open.</p><p>You get these keys from the Statue of the Seven offerings.</p>" }, cards: [
       shrine("Mondstadt", 0, "400", 10, 40), shrine("Liyue", 0, "400", 10, 40), shrine("Inazuma", 0, "400", 10, 40),
       shrine("Sumeru", 0, "400", 10, 40), shrine("Fontaine", 0, "400", 10, 40), shrine("Natlan", 0, "400", 10, 40),
       shrine("Nod-Krai", 0, "560", 7, 80),
@@ -280,6 +347,12 @@
       { t: "Remarkable Chest", ic: "p", r: [["p", "0 to 5 Primogems"]] },
       { t: "Precious Chest", ic: "p", r: [["p", "10 Primogems"]] },
       { t: "Luxurious Chest", ic: "p", r: [["p", "10 to 50 Primogems"]] }
+    ] },
+    { h: "Top up & Purchases", help: { title: "Reminder", html: "<p>Top ups and purchases are not recommended if you are a beginner. It is much better to play the game fully and enjoy it.</p><p>However, you can use them to get a lot of Primogems in a short time.</p>" }, cards: [
+      { t: "Genesis Crystal", ic: "p", r: [["p", "1 Genesis Crystal = 1 Primogem"]] },
+      { t: "Blessing of the Welkin Moon", ic: "p", r: [["p", "2,700 Primogems over 30 days"]], i: ["Instantly get 300 Genesis Crystals and 90 Primogems, plus 90 Primogems for every daily login.", "Note: Days you miss give no reward."] },
+      { t: "Gnostic Hymn", ic: "p", r: [["p", "680 Primogems"]], i: ["Get 680 Primogems once you reach the max level, 50."] },
+      { t: "Gnostic Chorus", ic: "p", r: [["p", "680 Primogems"]], i: ["Get 680 Primogems once you reach the max level, 50."] }
     ] }
   ];
   (function () {
@@ -287,7 +360,7 @@
     SOURCES.forEach(function (sec) {
       sec.cards.forEach(function (c) {
         var base = c.t.toLowerCase();
-        if (pre[sec.h]) { c.img = pre[sec.h] + " " + base; c.imgFb = pre[sec.h]; } else c.img = base;
+        if (pre[sec.h]) { c.img = pre[sec.h] + " " + base; c.imgFb = pre[sec.h]; } else c.img = c.img || base;
       });
     });
   })();
@@ -312,15 +385,22 @@
     if (c.req) { var p2 = document.createElement("p"); p2.innerHTML = "Required: " + rich(c.req); info.appendChild(p2); }
     a.appendChild(cardImg(c)); a.appendChild(h); a.appendChild(info); return a;
   }
+  function buildEmptyCard() {
+    var a = document.createElement("article"); a.className = "src empty";
+    var b = document.createElement("div"); b.className = "srcimg"; b.setAttribute("aria-hidden", "true");
+    var t = document.createElement("h3"); t.textContent = "Coming soon";
+    var info = document.createElement("div"); info.className = "srcinfo"; var p = document.createElement("p"); p.textContent = "Details will be added later."; info.appendChild(p);
+    a.appendChild(b); a.appendChild(t); a.appendChild(info); return a;
+  }
   function buildNav() {
     var box = $("navSections"); box.innerHTML = "";
     SOURCES.forEach(function (s) {
       var sec = document.createElement("section"); sec.className = "sec";
       var h = document.createElement("h2"); h.appendChild(document.createTextNode(s.h));
       if (s.help) {
-        var hb = document.createElement("button"); hb.type = "button"; hb.className = "helpbtn"; hb.textContent = "?"; hb.setAttribute("aria-label", "Guide: Elemental Sigils");
+        var hb = document.createElement("button"); hb.type = "button"; hb.className = "helpbtn"; hb.textContent = "?"; var hp = s.help === true ? { title: "Guide: Elemental Sigils", html: "<p>Elemental Sigils are needed for the regional offerings. You can get them from:</p><p><b>Regional chests</b>: Common, Exquisite, Luxurious and Precious chests.</p><p><b>Statue of the Seven</b> worship.</p><p><b>Shrine of Depths</b> chests.</p>" } : s.help; hb.setAttribute("aria-label", hp.title);
         hb.addEventListener("click", function () {
-          dialog({ title: "Guide: Elemental Sigils", html: "<p>Elemental Sigils are needed for the regional offerings. You can get them from:</p><p><b>Regional chests</b>: Common, Exquisite, Luxurious and Precious chests.</p><p><b>Statue of the Seven</b> worship.</p><p><b>Shrine of Depths</b> chests.</p>", buttons: [{ label: "Got it" }] });
+          dialog({ title: hp.title, html: hp.html, buttons: [{ label: "Got it" }] });
         });
         h.appendChild(hb);
       }
@@ -328,6 +408,7 @@
       var wrap = document.createElement("div"); wrap.className = "railwrap";
       var rail = document.createElement("div"); rail.className = "rail"; rail.setAttribute("role", "region"); rail.setAttribute("aria-label", s.h); rail.tabIndex = 0;
       s.cards.forEach(function (c) { rail.appendChild(buildCard(c)); });
+      for (var ei = 0; ei < (s.empty || 0); ei++) rail.appendChild(buildEmptyCard());
       function mk(dir, svg) {
         var b = document.createElement("button"); b.type = "button"; b.className = "railbtn " + (dir < 0 ? "prev" : "next"); b.setAttribute("aria-label", dir < 0 ? "Scroll left" : "Scroll right");
         b.innerHTML = svg; b.addEventListener("click", function () { rail.scrollBy({ left: dir * Math.max(240, rail.clientWidth * 0.8), behavior: "smooth" }); }); return b;
@@ -524,18 +605,16 @@
   }
   function finishQuest(q, add) {
     if (state.quests[q.id] && state.quests[q.id].done) return;
-    var now = new Date();
+    var now = new Date(), streakNew = false;
     state.quests[q.id] = { done: true, added: !!add, ts: now.getTime() };
     if (add) {
       if (q.p) state.total += q.p; else state.fates += q.f;
       state.history.push({ id: now.getTime() + "-" + state.history.length, ts: now.getTime(), amount: q.p || q.f, type: "add", cur: q.p ? "p" : "f", note: "Quest: " + q.t + " (" + rewardText(q) + ")" });
-      var today = dayKey(now), s = state.streak;
-      if (!s.last) s.count = 1; else { var gap = daysBetween(s.last, today); if (gap === 1) s.count += 1; else if (gap > 1 || gap < 0) s.count = 1; }
-      s.last = today;
+      streakNew = bumpStreak(now);
     }
     save();
     var w = document.querySelector('#questRoot .qwrap[data-id="' + q.id + '"]');
-    var after = function () { renderQuests(); renderDash(); toast(add ? "Quest done. Added " + gainText(q) + " to your savings" : "Quest marked as done. Savings unchanged"); };
+    var after = function () { renderQuests(); renderDash(); toast(add ? "Quest done. Added " + gainText(q) + " to your savings" : "Quest marked as done. Savings unchanged"); if (streakNew) showStreakSaved(); };
     if (w && !prefersReduced) { w.classList.add("leaving"); setTimeout(after, 260); } else after();
   }
   (function () {
@@ -579,17 +658,17 @@
   })();
 
   /* ---------- Modals / drawer ---------- */
-  var openId = null, lastFocus = null;
+  var openId = null, lastFocus = null, lockedM = false;
   function openM(id, focusEl) {
     if (!openId) lastFocus = document.activeElement;
     openId = id; $(id).hidden = false; document.body.classList.add("mlock");
     var f = typeof focusEl === "string" ? $(focusEl) : focusEl;
     if (f) setTimeout(function () { f.focus(); if (f.select) f.select(); }, 30);
   }
-  function closeM() { if (!openId) return; $(openId).hidden = true; openId = null; document.body.classList.remove("mlock"); if (lastFocus && lastFocus.focus) lastFocus.focus(); }
+  function closeM() { if (!openId) return; $(openId).hidden = true; openId = null; lockedM = false; document.body.classList.remove("mlock"); if (lastFocus && lastFocus.focus) lastFocus.focus(); }
   document.querySelectorAll("[data-close]").forEach(function (b) { b.addEventListener("click", closeM); });
   var swallowClick = false, swallowT = 0;
-  document.querySelectorAll(".overlay").forEach(function (o) { o.addEventListener("pointerdown", function (e) { if (e.target === o) { closeM(); swallowClick = true; clearTimeout(swallowT); swallowT = setTimeout(function () { swallowClick = false; }, 450); } }); });
+  document.querySelectorAll(".overlay").forEach(function (o) { o.addEventListener("pointerdown", function (e) { if (e.target === o) { if (lockedM) { e.preventDefault(); return; } closeM(); swallowClick = true; clearTimeout(swallowT); swallowT = setTimeout(function () { swallowClick = false; }, 450); } }); });
   document.addEventListener("click", function (e) { if (swallowClick) { swallowClick = false; e.preventDefault(); e.stopPropagation(); } }, true);
   function dialog(o) {
     $("dTitle").textContent = o.title;
@@ -600,7 +679,7 @@
       el.addEventListener("click", function () { var keep = b.fn ? b.fn() === false : false; if (!keep) closeM(); });
       row.appendChild(el);
     });
-    openM("mDialog", row.lastChild);
+    openM("mDialog", row.lastChild); lockedM = !!o.lock;
   }
   var drawerFocus = null;
   function openDrawer() { drawerFocus = document.activeElement; $("drawer").hidden = false; setTimeout(function () { $("dProfile").focus(); }, 30); }
@@ -608,7 +687,7 @@
   $("burger").addEventListener("click", openDrawer);
   $("drawerClose").addEventListener("click", closeDrawer);
   $("drawerBg").addEventListener("click", closeDrawer);
-  document.addEventListener("keydown", function (e) { if (e.key === "Escape") { if (openId) closeM(); else closeDrawer(); } });
+  document.addEventListener("keydown", function (e) { if (e.key === "Escape") { if (lockedM) return; if (openId) closeM(); else closeDrawer(); } });
   var tt = null;
   function toast(msg) { var t = $("toast"); t.textContent = msg; t.hidden = false; clearTimeout(tt); tt = setTimeout(function () { t.hidden = true; }, 2600); }
 
@@ -632,7 +711,7 @@
     });
     closeDrawer();
     sky(); renderTop();
-    if (view === "dashboard") renderDash();
+    if (view === "dashboard") { renderDash(); maybeRemind(); }
     if (view === "history") { renderHistory(); resetAskMode(false); }
     if (view === "quest") renderQuests();
     if (view === "chara") { buildChips(); renderChara(); }
@@ -706,13 +785,16 @@
   };
   function applyUser(u, remember) {
     var changed = (u ? u.uid : null) !== (user ? user.uid : null);
+    var oldKey = curKey, wasUser = !!user;
+    if (changed) stopCloud();
     user = u;
     if (u && !fbOn && remember) { memSess = u.email; lsSet(SESS, u.email); }
     curKey = u ? KEY + ".u." + u.uid : KEY;
+    if (changed && wasUser && !u && fbDb) { try { localStorage.removeItem(oldKey); } catch (e) {} }
     if (changed) {
       state = load();
-      if (u && u.name && (!state.name || state.name === "Traveler")) { state.name = u.name; save(); }
-      else if (u && !state.name) { state.name = (u.email || "Traveler").split("@")[0]; save(); }
+      if (u && u.name && (!state.name || state.name === "Traveler")) { state.name = u.name; writeLocal(); }
+      else if (u && !state.name) { state.name = (u.email || "Traveler").split("@")[0]; writeLocal(); }
     }
     renderTop();
   }
@@ -720,8 +802,8 @@
   function afterAuth() { authReady = true; route(); }
   function loadFirebase() {
     return new Promise(function (res, rej) {
-      function add(src, cb) { var s = document.createElement("script"); s.src = src; s.onload = cb; s.onerror = function () { rej(new Error("load")); }; document.head.appendChild(s); }
-      add(FB_BASE + "firebase-app-compat.js", function () { add(FB_BASE + "firebase-auth-compat.js", res); });
+      function add(src, cb, soft) { var s = document.createElement("script"); s.src = src; s.onload = cb; s.onerror = function () { if (soft) cb(); else rej(new Error("load")); }; document.head.appendChild(s); }
+      add(FB_BASE + "firebase-app-compat.js", function () { add(FB_BASE + "firebase-auth-compat.js", function () { add(FB_BASE + "firebase-firestore-compat.js", res, true); }); });
     });
   }
   function initAuth() {
@@ -731,16 +813,63 @@
       if (a) applyUser({ uid: uidOf(em), email: em, name: a.name || "", provider: "email" }, false);
       afterAuth(); return;
     }
-    var done = false, timer = setTimeout(function () { if (!done) { done = true; fbOn = false; afterAuth(); } }, 6000);
+    var done = false, timer = setTimeout(function () { if (!done) { done = true; fbOn = false; afterAuth(); } }, 9000);
     loadFirebase().then(function () {
       firebase.initializeApp(FIREBASE_CONFIG); fbAuth = firebase.auth();
+      try { if (firebase.firestore) fbDb = firebase.firestore(); } catch (e) { fbDb = null; }
       fbAuth.onAuthStateChanged(function (u) {
         applyUser(fbUser(u), false);
+        if (u) startCloud(); else { cloudSettled = true; }
         if (!done) { done = true; clearTimeout(timer); }
         afterAuth();
       });
     }).catch(function () { if (!done) { done = true; clearTimeout(timer); fbOn = false; afterAuth(); } });
   }
+
+  /* ---------- Cloud sync (Firestore: users/{uid} = { v, ts, json }) ---------- */
+  function hasData(s) { return !!s && (s.total > 0 || s.fates > 0 || s.history.length > 0 || s.owned.length > 0 || Object.keys(s.quests).length > 0 || !!(s.streak && s.streak.last) || s.goal !== DEFAULT_GOAL); }
+  function cloudDoc() { return fbDb.collection("users").doc(user.uid); }
+  function cloudFail() { if (!cloudWarned) { cloudWarned = true; toast("Cloud sync isn't available right now. Your data is saved on this device."); } }
+  function queuePush() { if (!user || !fbDb || !cloudReady) return; clearTimeout(pushT); pushT = setTimeout(pushNow, 900); }
+  function pushNow() {
+    clearTimeout(pushT); pushT = null;
+    if (!user || !fbDb || !cloudReady) return Promise.resolve();
+    var s = state;
+    return cloudDoc().set({ v: 1, ts: s.ts || Date.now(), json: JSON.stringify(s) }).catch(cloudFail);
+  }
+  function flushCloud() {
+    if (!pushT) return Promise.resolve();
+    return Promise.race([pushNow(), new Promise(function (r) { setTimeout(r, 2500); })]);
+  }
+  function refreshAll() {
+    renderTop(); var v = document.body.getAttribute("data-view");
+    if (v === "dashboard") renderDash(); else if (v === "history") renderHistory(); else if (v === "quest") renderQuests();
+    else if (v === "chara") { buildChips(); renderChara(); } else if (v === "profile") renderProfile();
+  }
+  function adopt(c) { state = normalize(c); writeLocal(); refreshAll(); }
+  function stopCloud() { if (cloudUnsub) { try { cloudUnsub(); } catch (e) {} cloudUnsub = null; } clearTimeout(pushT); pushT = null; cloudReady = false; cloudSettled = false; }
+  function listenCloud() {
+    if (cloudUnsub) return;
+    cloudUnsub = cloudDoc().onSnapshot(function (snap) {
+      if (!snap.exists || snap.metadata.hasPendingWrites) return;
+      try { var d = snap.data(); if ((d.ts || 0) <= (state.ts || 0)) return; var c = JSON.parse(d.json); c.ts = d.ts; adopt(c); } catch (e) {}
+    }, function () {});
+  }
+  function startCloud() {
+    if (!user || !fbDb) { cloudSettled = true; return; }
+    var uid = user.uid; cloudReady = false; cloudSettled = false;
+    cloudDoc().get().then(function (snap) {
+      if (!user || user.uid !== uid) return;
+      var cloud = null, needPush = true;
+      if (snap.exists) { try { var d = snap.data(); cloud = JSON.parse(d.json); cloud.ts = d.ts; } catch (e) { cloud = null; } }
+      if (cloud && typeof cloud === "object" && (!hasData(state) || (cloud.ts || 0) >= (state.ts || 0))) { adopt(cloud); needPush = false; }
+      cloudReady = true; cloudSettled = true;
+      if (needPush) pushNow();
+      listenCloud(); maybeRemind();
+    }).catch(function () { cloudFail(); cloudReady = false; cloudSettled = true; maybeRemind(); });
+  }
+  window.addEventListener("online", function () { if (!user || !fbDb) return; if (!cloudReady) startCloud(); else pushNow(); });
+  window.addEventListener("pagehide", function () { if (pushT) pushNow(); });
 
   /* ---------- Sign in / Sign up screen ---------- */
   function setAuthMsg(err, ok) { $("aErr").textContent = err || ""; $("aOk").textContent = ok || ""; }
@@ -791,7 +920,7 @@
   });
   function goGuest() { setGuest(true); location.hash = "dashboard"; }
   $("guestBtn").addEventListener("click", goGuest); $("guestBtn2").addEventListener("click", goGuest);
-  function signOutNow() { AuthAPI.out().then(function () { applyUser(null, false); closeDrawer(); toast("Signed out"); location.hash = "signin"; route(); }); }
+  function signOutNow() { flushCloud().then(function () { return AuthAPI.out(); }).then(function () { applyUser(null, false); closeDrawer(); toast("Signed out"); location.hash = "signin"; route(); }); }
   function signBtn() { if (user) signOutNow(); else { setGuest(false); location.hash = "signin"; } }
   $("pSign").addEventListener("click", signBtn); $("dSign").addEventListener("click", signBtn);
 
@@ -819,15 +948,14 @@
     if (p.v > (cur === "p" ? 9999999 : 99999)) { err.textContent = "That amount is too large. Enter " + (cur === "p" ? "9,999,999" : "99,999") + " or less."; return; }
     var have = cur === "p" ? state.total : state.fates;
     if (mode === "sub" && p.v > have) { err.textContent = "You only have " + fmt(have) + " saved, so you can't subtract " + fmt(p.v) + "."; return; }
-    var now = new Date();
+    var now = new Date(), streakNew = false;
     if (cur === "p") state.total += mode === "add" ? p.v : -p.v; else state.fates += mode === "add" ? p.v : -p.v;
     state.history.push({ id: now.getTime() + "-" + state.history.length, ts: now.getTime(), amount: p.v, type: mode, cur: cur, note: "" });
     if (mode === "add") {
-      var today = dayKey(now), s = state.streak;
-      if (!s.last) s.count = 1; else { var gap = daysBetween(s.last, today); if (gap === 1) s.count += 1; else if (gap > 1 || gap < 0) s.count = 1; }
-      s.last = today;
+      streakNew = bumpStreak(now);
     }
     save(); closeM(); renderDash();
+    if (streakNew) setTimeout(showStreakSaved, 250);
     var unit = cur === "p" ? " Primogems" : (p.v === 1 ? " Intertwined Fate" : " Intertwined Fates");
     toast(mode === "add" ? "Added " + fmt(p.v) + unit : "Subtracted " + fmt(p.v) + unit);
   });
